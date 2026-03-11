@@ -1,4 +1,4 @@
-//! io.select() Pattern - Subscription with Timeout
+//! Io.Select() Pattern - Subscription with Timeout
 //!
 //! Demonstrates io.select() to race a subscription receive against a timeout.
 //! This is the correct use case for io.select() with NATS - racing ONE
@@ -17,6 +17,7 @@ const nats = @import("nats");
 
 const Io = std.Io;
 const Sub = nats.Client.Sub;
+const Message = nats.Client.Message;
 
 /// Sleep function compatible with io.async()
 fn sleepMs(io: Io, ms: i64) void {
@@ -53,40 +54,34 @@ pub fn main(init: std.process.Init) !void {
     const max_attempts = 5;
 
     for (0..max_attempts) |attempt| {
-        // Create futures for receive and timeout
-        var recv_future = io.async(Sub.nextMsg, .{sub});
-        var timeout_future = io.async(sleepMs, .{ io, 500 });
-
-        // Track winner to avoid double-free
-        var winner: enum { none, message, timeout } = .none;
-
-        // Defer cancel for non-winners
-        defer if (winner != .message) {
-            if (recv_future.cancel(io)) |m| m.deinit() else |_| {}
+        const Result = union(enum) {
+            message: anyerror!Message,
+            timeout: void,
         };
-        defer if (winner != .timeout) {
-            timeout_future.cancel(io);
+        var result_buf: [2]Result = undefined;
+        var select = Io.Select(Result).init(io, &result_buf);
+        defer select.cancelDiscard();
+
+        _ = select.async(.message, Sub.nextMsg, .{sub});
+        _ = select.async(.timeout, sleepMs, .{ io, 500 });
+
+        const completed = select.await() catch |err| {
+            if (err == error.Canceled) break;
+            std.debug.print("  Select error: {}\n", .{err});
+            break;
         };
 
-        // Wait for EITHER message OR timeout
-        const result = io.select(.{
-            .message = &recv_future,
-            .timeout = &timeout_future,
-        }) catch break; // Defers handle cleanup
-
-        switch (result) {
+        switch (completed) {
             .message => |msg_result| {
-                winner = .message;
-                const msg = msg_result catch continue;
-                defer msg.deinit();
-                received += 1;
-                std.debug.print(
-                    "  [{d}] Received: {s}\n",
-                    .{ attempt + 1, msg.data },
-                );
+                if (msg_result) |msg| {
+                    defer msg.deinit();
+                    received += 1;
+                    std.debug.print("  [{d}] Received: {s}\n", .{ attempt + 1, msg.data });
+                } else |err| {
+                    std.debug.print("  [{d}] Receive error: {}\n", .{ attempt + 1, err });
+                }
             },
             .timeout => {
-                winner = .timeout;
                 std.debug.print("  [{d}] Timeout - no message\n", .{attempt + 1});
             },
         }

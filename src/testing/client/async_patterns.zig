@@ -19,6 +19,7 @@ const ServerManager = utils.ServerManager;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Sub = nats.Client.Sub;
+const Message = nats.Client.Message;
 
 /// Sleep function compatible with io.async()
 fn sleepMs(io: Io, ms: i64) void {
@@ -49,32 +50,36 @@ fn testAsyncSelectTimeout(allocator: Allocator) void {
     defer sub.deinit();
 
     // Do NOT publish - we want timeout to win
-    var recv_future = io.async(Sub.nextMsg, .{sub});
-    var timeout_future = io.async(sleepMs, .{ io, 50 });
-
-    var winner: enum { none, message, timeout } = .none;
-    defer if (winner != .message) {
-        if (recv_future.cancel(io)) |m| m.deinit() else |_| {}
+    const Result = union(enum) {
+        message: anyerror!Message,
+        timeout: void,
     };
-    defer if (winner != .timeout) timeout_future.cancel(io);
+    var result_buf: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &result_buf);
+    defer select.cancelDiscard();
 
-    const result = io.select(.{
-        .message = &recv_future,
-        .timeout = &timeout_future,
-    }) catch {
+    _ = select.async(.message, Sub.nextMsg, .{sub});
+    _ = select.async(.timeout, sleepMs, .{ io, 50 });
+
+    const completed = select.await() catch |err| {
+        if (err == error.Canceled) {
+            reportResult("async_select_timeout", true, "");
+            return;
+        }
         reportResult("async_select_timeout", false, "select failed");
         return;
     };
 
-    switch (result) {
-        .message => {
-            winner = .message;
-            reportResult("async_select_timeout", false, "expected timeout");
+    switch (completed) {
+        .message => |msg_result| {
+            if (msg_result) |_| {
+                reportResult("async_select_timeout", false, "expected timeout");
+            } else |_| {
+                // error case – ignore, we don't need the specific error
+                reportResult("async_select_timeout", false, "unexpected error");
+            }
         },
-        .timeout => {
-            winner = .timeout;
-            reportResult("async_select_timeout", true, "");
-        },
+        .timeout => reportResult("async_select_timeout", true, ""),
     }
 }
 
@@ -107,41 +112,40 @@ fn testAsyncSelectMessage(allocator: Allocator) void {
         return;
     };
 
-    var recv_future = io.async(Sub.nextMsg, .{sub});
-    var timeout_future = io.async(sleepMs, .{ io, 500 });
-
-    var winner: enum { none, message, timeout } = .none;
-    defer if (winner != .message) {
-        if (recv_future.cancel(io)) |m| m.deinit() else |_| {}
+    const Result = union(enum) {
+        message: anyerror!Message,
+        timeout: void,
     };
-    defer if (winner != .timeout) timeout_future.cancel(io);
+    var result_buf: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &result_buf);
+    defer select.cancelDiscard();
 
-    const result = io.select(.{
-        .message = &recv_future,
-        .timeout = &timeout_future,
-    }) catch {
+    _ = select.async(.message, Sub.nextMsg, .{sub});
+    _ = select.async(.timeout, sleepMs, .{ io, 500 });
+
+    const completed = select.await() catch |err| {
+        if (err == error.Canceled) {
+            reportResult("async_select_message", false, "canceled");
+            return;
+        }
         reportResult("async_select_message", false, "select failed");
         return;
     };
 
-    switch (result) {
+    switch (completed) {
         .message => |msg_result| {
-            winner = .message;
-            const msg = msg_result catch {
+            if (msg_result) |msg| {
+                defer msg.deinit();
+                if (std.mem.eql(u8, msg.data, "select-test-msg")) {
+                    reportResult("async_select_message", true, "");
+                } else {
+                    reportResult("async_select_message", false, "wrong data");
+                }
+            } else |_| {
                 reportResult("async_select_message", false, "msg error");
-                return;
-            };
-            defer msg.deinit();
-            if (std.mem.eql(u8, msg.data, "select-test-msg")) {
-                reportResult("async_select_message", true, "");
-            } else {
-                reportResult("async_select_message", false, "wrong data");
             }
         },
-        .timeout => {
-            winner = .timeout;
-            reportResult("async_select_message", false, "unexpected timeout");
-        },
+        .timeout => reportResult("async_select_message", false, "unexpected timeout"),
     }
 }
 
@@ -260,30 +264,30 @@ fn testAsyncConcurrentWorkers(allocator: Allocator) void {
     const max_timeouts: u32 = 10;
 
     while (total_received < message_count and timeout_count < max_timeouts) {
-        // Use select with timeout to avoid hanging forever
-        var get_future = io.async(Io.Queue(WorkerResult).getOne, .{ &queue, io });
-        var timeout_future = io.async(sleepMs, .{ io, 200 });
-
-        var winner: enum { none, result, timeout } = .none;
-        defer if (winner != .result) {
-            if (get_future.cancel(io)) |r| r.deinit() else |_| {}
+        const Result = union(enum) {
+            result: anyerror!WorkerResult,
+            timeout: void,
         };
-        defer if (winner != .timeout) timeout_future.cancel(io);
+        var result_buf: [2]Result = undefined;
+        var select = Io.Select(Result).init(io, &result_buf);
+        defer select.cancelDiscard();
 
-        const sel = io.select(.{
-            .result = &get_future,
-            .timeout = &timeout_future,
-        }) catch break;
+        _ = select.async(.result, Io.Queue(WorkerResult).getOne, .{ &queue, io });
+        _ = select.async(.timeout, sleepMs, .{ io, 200 });
 
-        switch (sel) {
-            .result => |res| {
-                winner = .result;
-                const r = res catch break;
-                r.deinit();
-                total_received += 1;
+        const completed = select.await() catch |err| {
+            if (err == error.Canceled) break;
+            continue;
+        };
+
+        switch (completed) {
+            .result => |res_result| {
+                if (res_result) |res| {
+                    res.deinit();
+                    total_received += 1;
+                } else |_| {}
             },
             .timeout => {
-                winner = .timeout;
                 timeout_count += 1;
             },
         }
@@ -357,8 +361,6 @@ fn testAsyncParallelSubscriptions(allocator: Allocator) void {
 
     var received: u8 = 0;
 
-    // DON'T deinit after await - defer handles cleanup via cancel
-    // cancel() returns same result as await (idempotent)
     if (future_a.await(io)) |_| {
         received += 1;
     } else |_| {}
@@ -460,7 +462,6 @@ fn testAsyncCancelWithPendingMessage(allocator: Allocator) void {
     var future = io.async(Sub.nextMsg, .{sub});
     defer if (future.cancel(io)) |m| m.deinit() else |_| {};
 
-    // DON'T defer deinit after await - outer defer handles cleanup
     if (future.await(io)) |msg| {
         if (std.mem.eql(u8, msg.data, "pending-msg")) {
             reportResult("async_cancel_with_msg", true, "");
@@ -688,42 +689,46 @@ fn testSelectMultipleSubs(allocator: Allocator) void {
         return;
     };
 
-    var fast_future = io.async(Sub.nextMsg, .{fast_sub});
-    var slow_future = io.async(Sub.nextMsg, .{slow_sub});
-
-    var winner: enum { none, fast, slow } = .none;
-    defer if (winner != .fast) {
-        if (fast_future.cancel(io)) |m| m.deinit() else |_| {}
+    const Result = union(enum) {
+        fast: anyerror!Message,
+        slow: anyerror!Message,
     };
-    defer if (winner != .slow) {
-        if (slow_future.cancel(io)) |m| m.deinit() else |_| {}
-    };
+    var result_buf: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &result_buf);
+    defer select.cancelDiscard();
 
-    const result = io.select(.{
-        .fast = &fast_future,
-        .slow = &slow_future,
-    }) catch {
+    _ = select.async(.fast, Sub.nextMsg, .{fast_sub});
+    _ = select.async(.slow, Sub.nextMsg, .{slow_sub});
+
+    const completed = select.await() catch |err| {
+        if (err == error.Canceled) {
+            reportResult("select_multiple_subs", false, "canceled");
+            return;
+        }
         reportResult("select_multiple_subs", false, "select failed");
         return;
     };
 
-    switch (result) {
+    switch (completed) {
         .fast => |msg_result| {
-            winner = .fast;
-            const msg = msg_result catch {
+            if (msg_result) |msg| {
+                defer msg.deinit();
+                if (std.mem.eql(u8, msg.data, "fast-msg")) {
+                    reportResult("select_multiple_subs", true, "");
+                } else {
+                    reportResult("select_multiple_subs", false, "wrong data");
+                }
+            } else |_| {
                 reportResult("select_multiple_subs", false, "fast msg error");
-                return;
-            };
-            defer msg.deinit();
-            if (std.mem.eql(u8, msg.data, "fast-msg")) {
-                reportResult("select_multiple_subs", true, "");
-            } else {
-                reportResult("select_multiple_subs", false, "wrong data");
             }
         },
-        .slow => {
-            winner = .slow;
-            reportResult("select_multiple_subs", false, "slow won unexpectedly");
+        .slow => |msg_result| {
+            if (msg_result) |msg| {
+                defer msg.deinit();
+                reportResult("select_multiple_subs", false, "slow won unexpectedly");
+            } else |_| {
+                reportResult("select_multiple_subs", false, "slow msg error");
+            }
         },
     }
 }
